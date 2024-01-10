@@ -1,8 +1,11 @@
 import requests
-from pymongo import MongoClient
+import time
+from pymongo import MongoClient, UpdateOne
 from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 import configparser
+import calendar
+
 
 config = configparser.ConfigParser()
 config.read('config.ini')
@@ -33,16 +36,34 @@ symbols_stocks = [
     'HRL', 'SJM', 'MKC', 'FLO', 'ADM', 'BG', 'INGR', 'TSN', 'HOG', 'HD',
     'LOW', 'WHR', 'NWL', 'LEG', 'MHK', 'MAS', 'PHM', 'DHI', 'LEN', 'KBH',
     'BZH', 'ORCL', 'GLW', 'EMR', 'ETN', 'SLB', 'HAL', 'DE', 'CL', 'EOG',
-    'OXY', 'DVN', 'MRO', 'SWN', 'RRC', 'CVS', 'EQT', 'FTI'
+    'OXY', 'DVN', 'MRO', 'SWN', 'RRC', 'CVS', 'EQT', 'FTI', 'AMZN', 'GOOGL',
+    'FB', 'NFLX', 'TSLA', 'AMD', 'NVDA', 'SBUX', 'NKE', 'ADI', 'QCOM', 'MS',
+    'BLK', 'CME', 'COF', 'PYPL', 'MA', 'V', 'ADBE', 'CRM', 'ORLY', 'WBA',
+    'KR', 'GILD', 'AMGN', 'UNH', 'ANTM', 'CI', 'AET', 'HUM', 'BKNG'
 ]
 
-symbols_currency = ["EUR", "GBP", "JPY", "CHF", "CAD"]
+# Rate limitations
+request_count = 0
+minute_start = time.time()
 
 
-def fetch_and_store_data(symbol, month, interval="1min", fetch_currency=False):
-    # Check if data for this symbol and month already exists in the database
-    if fetch_currency:
-        from_to = symbol.split("-")
+def handle_rate_limit():
+    global request_count, minute_start
+    if time.time() - minute_start > 60:
+        request_count = 0
+        minute_start = time.time()
+
+    if request_count >= 30:
+        sleep_time = 60 - (time.time() - minute_start)
+        print(f"Rate limit reached, sleeping for {sleep_time} seconds")
+        time.sleep(sleep_time)
+        request_count = 0
+        minute_start = time.time()
+
+
+def fetch_and_store_data(symbol, month, interval="1min"):
+    global request_count
+    handle_rate_limit()
 
     if collection.count_documents({"symbol": symbol, "date": {"$gte": datetime.strptime(month, '%Y-%m'),
                                                               "$lt": datetime.strptime(month, '%Y-%m') + timedelta(
@@ -50,55 +71,67 @@ def fetch_and_store_data(symbol, month, interval="1min", fetch_currency=False):
         print(f"Data for {symbol} for the month {month} already exists. Skipping API call.")
         return
 
-    if fetch_currency:
-        params = {
-            "function": "CURRENCY_EXCHANGE_RATE",
-            "from_symbol": from_to[0],
-            "to_symbol": from_to[1],
-            "interval": interval,  # Assuming you want 60min interval data
-            "outputsize": "full",
-            "apikey": api_key
-        }
-    else:
-        params = {
-            "function": "TIME_SERIES_INTRADAY",
-            "symbol": symbol,
-            "interval": interval,  # Assuming you want 60min interval data
-            "month": month,
-            "outputsize": "full",
-            "apikey": api_key
-        }
+    params = {
+        "function": "TIME_SERIES_INTRADAY",
+        "symbol": symbol,
+        "interval": interval,
+        "month": month,
+        "outputsize": "full",
+        "apikey": api_key
+    }
 
     response = requests.get(base_url, params=params)
+    request_count += 1
 
     if response.status_code == 200:
         data = response.json()
-
         if "Information" in data:
             print(f"Error fetching data for {symbol} for the month {month}")
             return
 
         time_series = data.get(f"Time Series ({interval})", {})
+
+        # Prepare bulk update operations
+        operations = []
         for date, stock_data in time_series.items():
-            tmp_data = dict()
-            tmp_data['open'] = float(stock_data['1. open'])
-            tmp_data['high'] = float(stock_data['2. high'])
-            tmp_data['low'] = float(stock_data['3. low'])
-            tmp_data['close'] = float(stock_data['4. close'])
-            tmp_data['volume'] = int(stock_data['5. volume'])
-            tmp_data['symbol'] = symbol
-            tmp_data['date'] = datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
-            collection.update_one(
-                {"symbol": symbol, "date": tmp_data['date']},
-                {"$set": tmp_data},
+            operation = UpdateOne(
+                {"symbol": symbol, "date": datetime.strptime(date, '%Y-%m-%d %H:%M:%S')},
+                {"$set": parse_data(stock_data, symbol, date)},
                 upsert=True
             )
+            operations.append(operation)
+
+        # Execute bulk write
+        if operations:
+            collection.bulk_write(operations)
     else:
         print(f"Error fetching data for {symbol} for the month {month}")
 
 
+def parse_data(data, symbol, date):
+    return {
+        "open": float(data['1. open']),
+        "high": float(data['2. high']),
+        "low": float(data['3. low']),
+        "close": float(data['4. close']),
+        "volume": int(data['5. volume']),
+        "symbol": symbol,
+        "date": datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
+    }
+
+
+def add_one_month(orig_date):
+    new_year = orig_date.year
+    new_month = orig_date.month + 1
+    if new_month > 12:
+        new_month = 1
+        new_year += 1
+    last_day = calendar.monthrange(new_year, new_month)[1]
+    return datetime(new_year, new_month, min(orig_date.day, last_day))
+
+
 if __name__ == '__main__':
-    start_date = datetime(2020, 1, 1)
+    start_date = datetime(2005, 1, 1)
     end_date = datetime.now()
     current_date = start_date
 
@@ -112,4 +145,4 @@ if __name__ == '__main__':
             fetch_and_store_data(symbol, month)
 
         # Add a month to the current date
-        current_date += timedelta(days=31)
+        current_date = add_one_month(current_date)
